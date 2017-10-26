@@ -1,70 +1,40 @@
 import sublime, sublime_plugin
 import json
-import re
-import sys
-import os
 
-try:
-    from urllib.request import urlopen
-    from urllib.parse import urlparse
-    from urllib.parse import quote
-    from urllib.error import HTTPError
-except ImportError:
-    from urlparse import urlparse
-    from urllib import quote
-    from urllib2 import urlopen
-    from urllib2 import HTTPError
-
-alternativesLocation = os.path.join(os.path.abspath(os.path.dirname(__file__)), "alternatives.py")
+from urllib.request import Request
+from urllib.request import urlopen
+from urllib.error import HTTPError
 
 class NoResultError(Exception):
-  def __init__(self, message):
-    self.message = message;
-
-  def __str__(self):
-    return repr(self.message)
+  pass
 
 class ThesaurusCommand(sublime_plugin.TextCommand):
   def run(self, edit):
-    self.result = []
     self.region = False
-    self.value = ""
-    self.edit = edit
 
-    # process our selected word
-    self.processWord(self.selected_word())
-
-  def noAction(self, value):
-    self.view.erase_status("Thesaurus")
-    pass
-
-  def processWord(self, word):
-    self.word = word
-    if self.word is None or len(self.word) == 0:
-      self.view.set_status("Thesaurus", "Please select a word first!")
-      sublime.active_window().show_quick_panel(["Please select a word first!"], self.noAction)
+    word = self.selected_word()
+    if word is None or len(word) == 0:
+      self.view.set_status('Thesaurus', 'Please select a word first')
       return
 
     try:
-      self.results = self.synonyms()
-      sublime.active_window().show_quick_panel(self.results, self.valueIsSelected)
+      results = list(self.synonyms(word))
+      options = [o['title'] for o in results]
+      sublime.active_window().show_quick_panel(options, lambda i: self.senseSelected(results, i))
     except NoResultError:
-      # nothing was found, look for alternatives
-      self.view.set_status("Thesaurus", "No results were found for '%s'!" % self.word)
-      self.alternatives = ["No results were found for '%s'!, try one of the following:" % self.word]
-      self.alternatives.extend(self.get_alternative_words())
-      sublime.active_window().show_quick_panel(self.alternatives, self.alternativeIsSelected)
+      self.view.set_status('Thesaurus', 'No synonyms found')
 
-  def alternativeIsSelected(self, value):
-    if value > 1:
-      self.processWord(self.alternatives[value])
+  def senseSelected(self, results, index):
+    if index != -1:
+      synonyms = list(results[index]['synonyms'])
+      sublime.active_window().show_quick_panel(synonyms, lambda i: self.synonymSelected(synonyms, i))
     else:
-      self.view.erase_status("Thesaurus")
+      self.view.erase_status('Thesaurus')
 
-  def valueIsSelected(self, value):
-    if value != -1:
-      self.replace(self.results[value])
-      self.view.erase_status("Thesaurus")
+  def synonymSelected(self, synonyms, index):
+    if index != -1:
+      self.view.run_command('replace_region', { 'region': { 'a': self.region.a, 'b': self.region.b }, 'value': synonyms[index] })
+    self.view.erase_status('Thesaurus')
 
   def selected_word(self):
     for region in self.view.sel():
@@ -72,72 +42,52 @@ class ThesaurusCommand(sublime_plugin.TextCommand):
         self.region = region
         return self.view.substr(region)
 
-  def replace(self, value):
-    if not self.region or value is None or len(value) == 1:
-      return
-
-    value = re.subn(r'\(.*?\)$', "", value)[0]
-    if value is not None:
-      self.view.replace(self.edit, self.region, value.strip().lower())
-
-  def synonyms(self):
+  def synonyms(self, word):
     result = []
     try:
-        data = self.get_json_from_api()
-        for entry in data["response"]:
-            result.append(entry["list"]["synonyms"].split("|"))
-    except (KeyError, HTTPError):
-        if 'data' in locals():
-            raise NoResultError(data["error"])
+      data = self.get_json_from_api(word)
+      return self.parse_response(data)
+    except HTTPError:
+      raise NoResultError()
+
+  def parse_response(self, response):
+    for entry in response['results'][0]['lexicalEntries']:
+      for sense in entry['entries'][0]['senses']:
+        synonyms = self.synonyms_from_sense(sense)
+        if 'examples' in sense and len(sense['examples']) > 0:
+          title = sense['examples'][0]['text']
         else:
-            raise NoResultError("Word not found.")
+          title = 'No examples :('
+        yield { 'title': title, 'synonyms': synonyms }
 
-    r = list(set([item for sublist in result for item in sublist]))
-    r.sort()
-    return r
-
-  def get_json_from_api(self):
-    word = quote(self.word)
-    url = "http://thesaurus.altervista.org/thesaurus/v1?key=%s&word=%s&language=%s&output=json" % (self.api_key(), word, self.language())
-    response = urlopen(url)
-    content = response.read().decode('utf-8')
-    response.close()
-    return json.loads(content)
-
-  def api_key(self):
-    settings = sublime.load_settings('Thesaurus.sublime-settings')
-    if settings.get("api_key"):
-      return settings.get("api_key")
+  def synonyms_from_sense(self, sense):
+    if 'subsenses' in sense:
+      return self.synonyms_from_senses(sense['subsenses'])
     else:
-      settings = sublime.load_settings('Preferences.sublime-settings')
-      return settings.get("thesaurus_api_key")
+      return self.synonyms_from_senses([sense])
+
+  def synonyms_from_senses(self, senses):
+    for sense in senses:
+      for synonym in sense['synonyms']:
+        yield synonym['text']
+
+  def get_json_from_api(self, word):
+    req = Request('https://od-api.oxforddictionaries.com/api/v1/entries/{}/{}/synonyms'.format(self.language(), word))
+    req.add_header('accept', 'application/json')
+    app_id, api_key = self.credentials()
+    req.add_header('app_id', app_id)
+    req.add_header('app_key', api_key)
+    with urlopen(req) as res:
+      return json.loads(res.read().decode('utf-8'))
+
+  def credentials(self):
+    settings = sublime.load_settings('Thesaurus.sublime-settings')
+    return settings.get('app_id'), settings.get('api_key')
 
   def language(self):
     settings = sublime.load_settings('Thesaurus.sublime-settings')
-    if settings.get("language"):
-      return settings.get("language")
-    else:
-      settings = sublime.load_settings('Preferences.sublime-settings')
-      return settings.get("thesaurus_language")
+    return settings.get('language', 'en')
 
-  def get_alternative_words(self):
-    # dirty hack around not being able to use enchant in sublime
-    import subprocess
-    try:
-      p = subprocess.Popen(["python", alternativesLocation, self.word], stdout=subprocess.PIPE)
-      alternativesString = p.communicate()[0]
-      p.stdout.close()
-      alternatives = []
-      # this will replace the alternatives var
-      exec(alternativesString)
-    except Exception as err:
-      alternatives = ['error', str(err)]
-    if alternatives[0] == "error":
-      print("Enchant error: %s, defaulting to dummy method..." % alternatives[1])
-      # nope, an error occurred, do it the dummy way
-      suffixes = ["es", "s", "ed", "er", "ly", "ing"]
-      alternatives = []
-      for suffix in suffixes:
-        if self.word.endswith(suffix):
-          alternatives.append(self.word[:(-1*len(suffix))]);
-    return alternatives
+class ReplaceRegionCommand(sublime_plugin.TextCommand):
+  def run(self, edit, region, value):
+    self.view.replace(edit, sublime.Region(region['a'], region['b']), value)
